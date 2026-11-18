@@ -355,6 +355,10 @@ class MigrationWorker(threading.Thread):
             conn.execute(
                 f"DROP TRIGGER IF EXISTS {self.ids['trg']} ON observations_default"
             )
+            # 3.5) 标记"迁移内部搬迁"：让质控隔离触发器跳过下面的搬迁 DELETE。
+            #      该 SET 仅本事务本会话有效；此时父表已持 SHARE 锁，外部写不进来，
+            #      因此不会有真实采集更正被一并跳过。提交/回滚后 GUC 自动复位。
+            conn.execute("SET LOCAL app.migration_in_progress = 'on'")
             # 4) 漏网行搬迁（正常情况下为 0 行；影子表里的新值优先）
             cur = conn.execute(
                 f"""
@@ -369,6 +373,7 @@ class MigrationWorker(threading.Thread):
                 (self.lo, self.hi),
             )
             moved = cur.rowcount
+            conn.execute("SET LOCAL app.migration_in_progress = 'off'")
             # 5) 故障注入：锁已拿、增量已回放，在 ATTACH 前失败 —— 验证整体回滚
             self._maybe_fail("finalizing")
             # 6) 挂载分区（影子表带 CHECK，跳过校验扫描；需短暂 ACCESS EXCLUSIVE）

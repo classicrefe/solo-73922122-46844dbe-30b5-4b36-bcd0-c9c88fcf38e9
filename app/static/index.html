@@ -39,6 +39,7 @@
   .tag.run  { background:#20365c; color:var(--acc); }
   .tag.fail { background:#4a2626; color:var(--bad); }
   .tag.idle { background:#2a3550; color:var(--dim); }
+  .tag.quar { background:#4a3a1d; color:var(--warn); }
   #log { height:180px; overflow:auto; background:#0b0f18; border:1px solid var(--line);
          border-radius:6px; padding:8px; font:12px/1.6 ui-monospace,Consolas,monospace;
          white-space:pre-wrap; }
@@ -124,6 +125,38 @@
     <div id="vResult" class="mono" style="font-size:13px;white-space:pre-wrap">—</div>
   </section>
 
+  <!-- 质控隔离 -->
+  <section class="card wide">
+    <h2>⑥ 质控隔离（父表保留原值，下游可信取数自动跳过被隔离观测）</h2>
+    <div class="row">
+      <label>站号</label><input id="qStation" placeholder="ST001" style="width:110px">
+      <label>UTC时刻</label><input id="qTs" placeholder="2026-11-01T08:00:00+00:00" style="width:250px">
+      <label>页面所见测值</label><input id="qValue" type="number" style="width:90px">
+      <button onclick="doMark()">标记隔离</button>
+      <button class="ghost" onclick="doRelease()">解除隔离</button>
+      <span id="qMarkMsg" class="dim"></span>
+    </div>
+    <div class="row">
+      <label>可信取数月份</label><select id="tMonth"></select>
+      <button onclick="doTrusted()">查询未隔离观测</button>
+      <label><input type="checkbox" id="tAuto"> 每秒自动刷新</label>
+      <span id="tSummary" class="mono" style="font-size:13px">—</span>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+      <div>
+        <div class="dim" style="margin:6px 0">可信观测样本（未隔离）</div>
+        <table id="tRows"><thead><tr><th>站号</th><th>时刻(UTC)</th><th>测值</th><th></th></tr></thead>
+          <tbody></tbody></table>
+      </div>
+      <div>
+        <div class="dim" style="margin:6px 0">当前隔离清单 <button class="ghost" style="padding:2px 8px;font-size:12px"
+          onclick="loadQuarantine()">刷新</button></div>
+        <table id="qList"><thead><tr><th>站号</th><th>时刻(UTC)</th><th>标记测值</th><th>当前测值</th><th>操作</th></tr></thead>
+          <tbody></tbody></table>
+      </div>
+    </div>
+  </section>
+
   <!-- 日志 -->
   <section class="card wide">
     <h2>运行日志</h2>
@@ -183,7 +216,7 @@ async function refresh() {
 }
 
 function syncSelects(months) {
-  for (const id of ['mMonth','wMonth','qMonth','vMonth']) {
+  for (const id of ['mMonth','wMonth','qMonth','vMonth','tMonth']) {
     const el = document.getElementById(id);
     const cur = el.value;
     if (el.dataset.sig === months.join(',')) continue;
@@ -267,6 +300,95 @@ async function doVerify() {
     `结论: <span class="${cls}">${r.consistent ? '一致 ✓' : '不一致 ✗'}</span>`;
 }
 
+// --------------------------------------------------------------- 质控隔离
+function fillMarkForm(station, ts, value) {
+  document.getElementById('qStation').value = station;
+  document.getElementById('qTs').value = ts;
+  document.getElementById('qValue').value = value;
+}
+
+async function doMark() {
+  const msg = document.getElementById('qMarkMsg');
+  msg.textContent = '';
+  const body = {
+    station_id: document.getElementById('qStation').value.trim(),
+    ts: document.getElementById('qTs').value.trim(),
+    observed_value: +document.getElementById('qValue').value,
+  };
+  try {
+    const r = await api('/api/quarantine', {method:'POST', body: JSON.stringify(body)});
+    msg.innerHTML = `<span class="ok">已隔离 ${r.station_id} @ ${r.ts}（测值 ${r.marked_value}）</span>`;
+  } catch (e) {
+    msg.innerHTML = `<span class="bad">标记失败：${e.message}</span>`;
+    return;
+  }
+  loadQuarantine();
+  doTrusted();
+}
+
+async function doRelease() {
+  const msg = document.getElementById('qMarkMsg');
+  const body = {
+    station_id: document.getElementById('qStation').value.trim(),
+    ts: document.getElementById('qTs').value.trim(),
+  };
+  try {
+    const r = await api('/api/quarantine/release', {method:'POST', body: JSON.stringify(body)});
+    msg.innerHTML = r.released
+      ? `<span class="ok">已解除 ${r.station_id} @ ${r.ts}</span>`
+      : `<span class="dim">该键本就没有隔离登记</span>`;
+  } catch (e) {
+    msg.innerHTML = `<span class="bad">解除失败：${e.message}</span>`;
+    return;
+  }
+  loadQuarantine();
+  doTrusted();
+}
+
+async function releaseRow(station, ts) {
+  await api('/api/quarantine/release', {method:'POST',
+    body: JSON.stringify({station_id: station, ts})});
+  loadQuarantine();
+  doTrusted();
+}
+
+async function loadQuarantine() {
+  const month = document.getElementById('tMonth').value;
+  let r;
+  try { r = await api(`/api/quarantine?month=${month}&limit=200`); }
+  catch (e) { return; }
+  document.querySelector('#qList tbody').innerHTML = r.items.length
+    ? r.items.map(x => {
+        const cur = x.row_exists ? x.current_value
+          : '<span class="bad">行已删除</span>';
+        const changed = x.value_changed ? ' class="bad"' : '';
+        return `<tr>
+          <td>${x.station_id}</td>
+          <td class="mono">${x.ts}</td>
+          <td>${x.marked_value}</td>
+          <td${changed}>${cur}</td>
+          <td><button class="danger" style="padding:2px 8px;font-size:12px"
+            onclick="releaseRow('${x.station_id}','${x.ts}')">解除</button></td>
+        </tr>`;
+      }).join('')
+    : '<tr><td colspan="5" class="dim">该月暂无隔离</td></tr>';
+}
+
+async function doTrusted() {
+  const month = document.getElementById('tMonth').value;
+  const r = await api(`/api/trusted?month=${month}&limit=30`);
+  document.getElementById('tSummary').innerHTML =
+    `父表 <b>${r.parent_count}</b> 行 · 隔离中
+     <b style="color:var(--warn)">${r.quarantined_count}</b> ·
+     可信 <b class="ok">${r.trusted_count}</b>`;
+  document.querySelector('#tRows tbody').innerHTML = r.sample.map(x =>
+    `<tr><td>${x.station_id}</td><td class="mono">${x.ts}</td><td>${x.value}</td>
+     <td><button class="ghost" style="padding:2px 8px;font-size:12px"
+       onclick='fillMarkForm(${JSON.stringify(x.station_id)},${JSON.stringify(x.ts)},${x.value})'>隔离</button></td>
+     </tr>`).join('');
+  loadQuarantine();
+}
+
 async function pollLog() {
   try {
     const r = await api('/api/logs?since=' + logSeq);
@@ -286,10 +408,15 @@ document.getElementById('wAuto').onclick = toggleAuto;
 document.getElementById('qAuto').onchange = e => {
   if (e.target.checked) doQuery();
 };
+document.getElementById('tAuto').onchange = e => {
+  if (e.target.checked) doTrusted();
+};
 setInterval(refresh, 1000);
 setInterval(pollLog, 1000);
 setInterval(() => { if (document.getElementById('qAuto').checked) doQuery(); }, 1000);
+setInterval(() => { if (document.getElementById('tAuto').checked) doTrusted(); }, 1000);
 refresh();
+setTimeout(() => { doTrusted(); }, 300);
 </script>
 </body>
 </html>

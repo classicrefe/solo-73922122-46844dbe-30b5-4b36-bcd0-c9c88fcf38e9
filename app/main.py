@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 import migrator
+import quarantine
 from db import connect, ensure_meta_tables, log, logs_since
 from migrator import (
     AlreadyDone,
@@ -20,6 +21,15 @@ from migrator import (
     next_month,
     parse_month,
     start_migration,
+)
+from quarantine import (
+    ObservationNotFound,
+    RowLocked,
+    ValueMismatch,
+    list_quarantines,
+    mark_quarantined,
+    release_quarantine,
+    trusted_query,
 )
 
 app = FastAPI(title="观测数据月分区在线迁移")
@@ -300,6 +310,63 @@ def api_debug_crash():
     log("[debug] 收到崩溃指令，进程即将硬退出（模拟宕机）")
     threading.Timer(0.2, lambda: os._exit(1)).start()
     return {"crashing": True}
+
+
+# ------------------------------------------------------------- 质控隔离
+class MarkReq(BaseModel):
+    station_id: str = Field(min_length=1, max_length=64)
+    ts: str = Field(min_length=1, max_length=64)
+    observed_value: int
+
+
+class ReleaseReq(BaseModel):
+    station_id: str = Field(min_length=1, max_length=64)
+    ts: str = Field(min_length=1, max_length=64)
+
+
+@app.post("/api/quarantine")
+def api_mark(req: MarkReq):
+    """标记隔离：单事务内行锁核对页面所见测值与当前记录，一致才登记。"""
+    try:
+        result = mark_quarantined(req.station_id, req.ts, req.observed_value)
+    except ObservationNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except (ValueMismatch, RowLocked) as e:
+        # 409：测值对不上（已更正）或行正被锁定，旧请求不得隔离，提示重新核对/重试
+        raise HTTPException(status_code=409, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    log(f"[质控隔离] 标记 {result}")
+    return result
+
+
+@app.post("/api/quarantine/release")
+def api_release(req: ReleaseReq):
+    """人工解除隔离。"""
+    try:
+        result = release_quarantine(req.station_id, req.ts)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    log(f"[质控隔离] 解除 {result}")
+    return result
+
+
+@app.get("/api/quarantine")
+def api_quarantine_list(month: str | None = None, limit: int = 200):
+    """隔离清单（可按月过滤），含登记测值与父表当前测值对照。"""
+    try:
+        return list_quarantines(month, limit)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/trusted")
+def api_trusted(month: str, limit: int = 50):
+    """按月可信取数：仅返回未隔离观测，并给出隔离/总数对照。"""
+    try:
+        return trusted_query(month, limit)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 # --------------------------------------------------------------------- 校验
